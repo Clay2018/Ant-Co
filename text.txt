@@ -1,3 +1,7 @@
 the first commit
 the second commit
+<<<<<<< HEAD
 the third commit
+=======
+the third commit
+>>>>>>> 6670758... the third commit
