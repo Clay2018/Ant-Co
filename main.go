@@ -1,40 +1,42 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
+	"math/rand"
+	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 )
 
-const difficulty = 1
-
 type Block struct {
 	Index 			int
-	Timestamp		string
+	TimeStamp		string
 	BPM				int
 	Hash 			string
-	PrevHash 		string
-	Difficulty		int
-	Nonce			string
+	PrevHash		string
+	Validator 		string
 }
 
 var Blockchain []Block
+var tempBlocks []Block
 
-type Message struct {
-	BPM int
-}
+
+var candidateBlocks = make(chan Block)
+
+// anouncements broadcasts winning validator to all nodes
+var announcements = make(chan string)
+
+var validators = make(map[string]int)
 
 var mutex = &sync.Mutex{}
 
@@ -44,90 +46,168 @@ func main() {
 		log.Fatal(err)
 	}
 
-	go func() {
-		t := time.Now()
-		genesisBlock := Block{}
-		genesisBlock = Block{0, t.String(), 0, calculateHash(genesisBlock), "",
-			difficulty, ""}
-		mutex.Lock()
-		Blockchain = append(Blockchain, genesisBlock)
-		mutex.Unlock()
-	}()
-	log.Fatal(run())
-}
+	t := time.Now()
+	genesisBlock := Block{}
+	genesisBlock = Block{0, t.String(), 0, calculateBlockHash(genesisBlock), "",
+		""}
+	Blockchain = append(Blockchain, genesisBlock)
 
-func run() error {
-	mux := makeMuxRouter()
-	httpPort := os.Getenv("PORT")
-	log.Println("HTTP Server Listening on port :", httpPort)
-
-	s := &http.Server{
-		Addr:			":" + httpPort,
-		Handler: 		mux,
-		ReadTimeout:	10 * time.Second,
-		WriteTimeout: 	10 * time.Second,
-		MaxHeaderBytes: 1 << 20,
-	}
-
-
-	if err := s.ListenAndServe(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func makeMuxRouter() http.Handler {
-	muxRouter := mux.NewRouter()
-	muxRouter.HandleFunc("/", handleGetBlockchain).Methods("GET")
-	muxRouter.HandleFunc("/", handleWriteBlock).Methods("POST")
-	return muxRouter
-}
-
-func handleGetBlockchain(w http.ResponseWriter, r *http.Request) {
-	bytes, err := json.MarshalIndent(Blockchain, "", "  ")
+	tcpPort := os.Getenv("PORT")
+	server, err := net.Listen("tcp", ":" + tcpPort)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		log.Fatal(err)
 	}
-	io.WriteString(w, string(bytes))
+
+	log.Println("TCP Server Listening on port:", tcpPort)
+	defer server.Close()
+
+	go func() {
+		for candidate := range candidateBlocks {
+			mutex.Lock()
+			tempBlocks = append(tempBlocks, candidate)
+			mutex.Unlock()
+		}
+	}()
+
+	go func() {
+		for {
+			pickWinner()
+		}
+	}()
+
+	for {
+		conn, err := server.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go handleConn(conn)
+	}
 }
 
-func handleWriteBlock(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	var m Message
 
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&m); err != nil {
-		respondWithJSON(w, r, http.StatusBadRequest, r.Body)
-	}
-	defer r.Body.Close()
-
+func pickWinner() {
+	time.Sleep(30 * time.Second)
 	mutex.Lock()
-	newBlock := generateBlock(Blockchain[len(Blockchain)-1], m.BPM)
+	temp := tempBlocks
 	mutex.Unlock()
 
-	if isBlockValid(newBlock, Blockchain[len(Blockchain)-1]) {
-		Blockchain = append(Blockchain, newBlock)
+	lotteryPool := []string{}
+	if len(temp) > 0 {
+
+	OUTER:
+		for _, block := range temp {
+			for _, node := range lotteryPool {
+				if block.Validator == node {
+					continue OUTER
+				}
+			}
+
+			mutex.Lock()
+			setValidators := validators
+			mutex.Unlock()
+
+			k, ok := setValidators[block.Validator]
+			if ok {
+				for i := 0; i < k; i++ {
+					lotteryPool = append(lotteryPool, block.Validator)
+				}
+			}
+		}
+
+		s := rand.NewSource(time.Now().Unix())
+		r := rand.New(s)
+		lotteryWinner := lotteryPool[r.Intn(len(lotteryPool))]
+
+		for _, block := range temp {
+			if block.Validator == lotteryWinner {
+				mutex.Lock()
+				Blockchain = append(Blockchain, block)
+				mutex.Unlock()
+				for _ = range validators {
+					announcements <- "\nwinning validator: " + lotteryWinner + "\n"
+				}
+				break
+			}
+		}
 	}
 
-	respondWithJSON(w, r, http.StatusCreated, newBlock)
+	mutex.Lock()
+	tempBlocks = []Block{}
+	mutex.Unlock()
 }
 
-func respondWithJSON(w http.ResponseWriter, r *http.Request, code int, payload interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	response, err := json.MarshalIndent(payload, "", " ")
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("HTTP 500: Internal Server Error"))
-		return
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	go func() {
+		for {
+			msg := <- announcements
+			io.WriteString(conn, msg)
+		}
+	}()
+
+	var address string
+	io.WriteString(conn, "Enter token balance:")
+	scanBalance := bufio.NewScanner(conn)
+	for scanBalance.Scan() {
+		balance, err := strconv.Atoi(scanBalance.Text())
+		if err != nil {
+			log.Printf("%v not a number: %v", scanBalance.Text(), err)
+			return
+		}
+		t := time.Now()
+		address = calculateHash(t.String())
+		validators[address] = balance
+		fmt.Println(validators)
+		break
 	}
-	w.WriteHeader(code)
-	w.Write(response)
+	log.Println("debug2")
+
+	io.WriteString(conn, "\nEnter a new BPM:")
+
+	scanBPM := bufio.NewScanner(conn)
+
+	go func() {
+		for {
+			for scanBPM.Scan() {
+				bpm, err := strconv.Atoi(scanBPM.Text())
+				if err != nil {
+					log.Printf("%v not number: %v", scanBPM.Text(), err)
+					delete(validators, address)
+					conn.Close()
+				}
+
+				mutex.Lock()
+				oldBlock := Blockchain[len(Blockchain)-1]
+				mutex.Unlock()
+
+				newBlock, err := generateBlock(oldBlock, bpm, address)
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+				if isBlockValid(newBlock, oldBlock) {
+					candidateBlocks <- newBlock
+				}
+				io.WriteString(conn, "\nEnter a new BPM:")
+			}
+		}
+	}()
+
+	for {
+		time.Sleep(time.Minute)
+		mutex.Lock()
+		output, err := json.Marshal(Blockchain)
+		mutex.Unlock()
+		if err != nil {
+			log.Fatal(err)
+		}
+		io.WriteString(conn, string(output) + "\n")
+	}
 }
 
 func isBlockValid(newBlock, oldBlock Block) bool {
-	if oldBlock.Index+1 != newBlock.Index {
+	if newBlock.Index != oldBlock.Index+1 {
 		return false
 	}
 
@@ -135,48 +215,34 @@ func isBlockValid(newBlock, oldBlock Block) bool {
 		return false
 	}
 
-	if calculateHash(newBlock) != newBlock.Hash {
+	if calculateBlockHash(newBlock) != newBlock.Hash {
 		return false
 	}
-
 	return true
 }
 
-func calculateHash(block Block) string {
-	record := strconv.Itoa(block.Index) + block.Timestamp + strconv.Itoa(block.BPM) + block.PrevHash + block.Nonce
+func calculateHash(s string) string {
 	h := sha256.New()
-	h.Write([]byte(record))
-	hashed := h.Sum(nil)
-	return hex.EncodeToString(hashed)
+	h.Write([]byte(s))
+	hash := h.Sum(nil)
+	return hex.EncodeToString(hash)
 }
 
-func generateBlock(oldBlock Block, BPM int) Block {
-	var newBlock Block
-	t := time.Now()
+func calculateBlockHash(block Block) string {
+	record := string(block.Index) + block.TimeStamp + string(block.BPM) + block.PrevHash
+	return calculateHash(record)
+}
 
+func generateBlock(oldBlock Block, BPM int, address string) (Block, error) {
+	var newBlock Block
+
+	t := time.Now()
 	newBlock.Index = oldBlock.Index + 1
-	newBlock.Timestamp = t.String()
+	newBlock.TimeStamp = t.String()
 	newBlock.BPM = BPM
 	newBlock.PrevHash = oldBlock.Hash
-	newBlock.Difficulty = difficulty
+	newBlock.Hash = calculateBlockHash(newBlock)
+	newBlock.Validator = address
 
-	for i := 0; ; i++ {
-		hex := fmt.Sprintf("%x", i)
-		newBlock.Nonce = hex
-		if !isHashValid(calculateHash(newBlock), newBlock.Difficulty) {
-			fmt.Println(calculateHash(newBlock), " do more work!")
-			time.Sleep(time.Second)
-			continue
-		} else {
-			fmt.Println(calculateHash(newBlock), " work done!")
-			newBlock.Hash = calculateHash(newBlock)
-			break
-		}
-	}
-	return newBlock
-}
-
-func isHashValid(hash string, difficulty int) bool {
-	prefix := strings.Repeat("0", difficulty)
-	return strings.HasPrefix(hash, prefix)
+	return newBlock, nil
 }
