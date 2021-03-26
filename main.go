@@ -246,3 +246,4 @@ func generateBlock(oldBlock Block, BPM int, address string) (Block, error) {
 
 	return newBlock, nil
 }
+
